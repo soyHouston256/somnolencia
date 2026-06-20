@@ -16,10 +16,17 @@
    3) MICROSUEÑO    -> si el EAR queda por debajo del umbral durante varios
                        cuadros seguidos = ojos cerrados de verdad (no un
                        parpadeo).
-   4) RESPUESTA     -> se suma el bostezo (MAR) como señal de fatiga y se
-                       decide un estado escalonado:
-                         ALERTA (verde) -> FATIGA (amarillo) -> MICROSUEÑO (rojo)
-                       En un auto real, el rojo dispararía una alarma sonora.
+   4) RESPUESTA     -> en vez de saltar de "despierto" a "dormido", se integra
+                       un INDICE DE SOMNOLENCIA continuo (0-100): sube de forma
+                       gradual mientras el ojo permanece cerrado (ponderado por
+                       cuánto se cierra) y por los bostezos, y baja cuando el
+                       conductor vuelve a estar alerta. El indice define un
+                       estado escalonado y sensible:
+                         ALERTA (verde) -> SOMNOLENCIA LEVE (amarillo) ->
+                         FATIGA (naranja) -> SOMNOLENCIA ALTA (naranja-rojo) ->
+                         MICROSUEÑO (rojo).
+                       Asi la transicion es suave y se avisa mucho antes. En un
+                       auto real, el rojo dispararía una alarma sonora.
 
  El EAR y el MAR son COCIENTES de distancias, así que el sistema es
  independiente de la resolución. Además se autocalibra: mide el EAR base de
@@ -43,6 +50,7 @@
 """
 import argparse
 import time
+from collections import deque
 
 import cv2
 import numpy as np
@@ -85,12 +93,29 @@ FRAMES_MICROSUENO    = 12     # cuadros seguidos con el ojo cerrado = microsueñ
 UMBRAL_BOSTEZO       = 0.60   # MAR por encima de esto = boca muy abierta
 FRAMES_BOSTEZO       = 10     # cuadros seguidos de boca abierta = bostezo
 
+# --- Índice de somnolencia (0-100): transición gradual, no un salto binario ---
+# En vez de decidir "despierto / dormido", se integra una señal continua que
+# sube mientras el ojo se cierra y baja cuando vuelve a abrirse. Así el sistema
+# es mucho más sensible y avisa por niveles antes de llegar al microsueño.
+ALFA_SUAVIZADO_EAR = 0.30   # peso del EAR nuevo en la media móvil exponencial (EMA)
+FACTOR_PERCLOS     = 0.80   # umbral P80: ojo "cerrado" si apertura < 80% del EAR base (estándar PERCLOS)
+VENTANA_PERCLOS_S  = 4.0    # segundos de la ventana deslizante de PERCLOS
+SUBIDA_INDICE      = 3.5    # cuánto sube el índice por cuadro con el ojo completamente cerrado
+BAJADA_INDICE      = 2.0    # cuánto baja el índice por cuadro cuando el conductor está alerta
+APORTE_BOSTEZO     = 1.5    # puntos extra por cuadro durante un bostezo
+
+# Cortes del índice para el estado escalonado (orden de severidad creciente).
+UMBRAL_LEVE       = 25      # índice >= -> SOMNOLENCIA LEVE
+UMBRAL_FATIGA     = 50      # índice >= -> FATIGA
+UMBRAL_ALTA       = 75      # índice >= -> SOMNOLENCIA ALTA
+UMBRAL_MICROSUENO = 90      # índice >= -> MICROSUENO (dispara la alarma)
+
 # --- Autocalibración del EAR base ---
 FRAMES_CALIBRACION = 30       # primeros cuadros con rostro (ojos abiertos)
 
 # --- Visualización ---
 ALTO_BANNER         = 60      # franja de estado, arriba
-ALTO_PANEL          = 70      # panel de métricas, abajo
+ALTO_PANEL          = 95      # panel de métricas, abajo (incluye barra de nivel)
 OPACIDAD_PANEL      = 0.45
 GROSOR_BORDE        = 12
 RADIO_PUNTO         = 2
@@ -99,15 +124,19 @@ ESCALA_PANEL        = 0.60
 UMBRAL_BRILLO_TEXTO = 140     # sobre este brillo se usa texto negro, si no blanco
 
 # Colores en BGR (OpenCV NO usa RGB).
-COLOR_VERDE    = (0, 180, 0)
-COLOR_AMARILLO = (0, 200, 220)
-COLOR_ROJO     = (0, 0, 255)
-COLOR_BLANCO   = (255, 255, 255)
-COLOR_NEGRO    = (0, 0, 0)
+COLOR_VERDE       = (0, 180, 0)
+COLOR_AMARILLO    = (0, 200, 220)
+COLOR_NARANJA     = (0, 140, 255)
+COLOR_NARANJA_ROJO = (0, 80, 255)
+COLOR_ROJO        = (0, 0, 255)
+COLOR_BLANCO      = (255, 255, 255)
+COLOR_NEGRO       = (0, 0, 0)
 
-# Estados posibles del conductor.
+# Estados posibles del conductor (orden de severidad creciente).
 ESTADO_ALERTA     = "ALERTA"
+ESTADO_LEVE       = "SOMNOLENCIA LEVE"
 ESTADO_FATIGA     = "FATIGA"
+ESTADO_ALTA       = "SOMNOLENCIA ALTA"
 ESTADO_MICROSUENO = "MICROSUENO"
 
 FUENTE = cv2.FONT_HERSHEY_SIMPLEX
@@ -168,10 +197,14 @@ def puntos_en_pixeles(landmarks, indices, ancho, alto):
 # ==========================================================================
 
 def color_de_estado(estado):
-    """Color BGR asociado a cada estado."""
+    """Color BGR asociado a cada estado (de verde a rojo según severidad)."""
     if estado == ESTADO_MICROSUENO:
         return COLOR_ROJO
+    if estado == ESTADO_ALTA:
+        return COLOR_NARANJA_ROJO
     if estado == ESTADO_FATIGA:
+        return COLOR_NARANJA
+    if estado == ESTADO_LEVE:
         return COLOR_AMARILLO
     return COLOR_VERDE
 
@@ -180,9 +213,54 @@ def mensaje_de_estado(estado):
     """Texto del banner para cada estado (solo ASCII para que se vea bien)."""
     if estado == ESTADO_MICROSUENO:
         return "MICROSUENO - DESPIERTA"
+    if estado == ESTADO_ALTA:
+        return "SOMNOLENCIA ALTA - DETENTE PRONTO"
     if estado == ESTADO_FATIGA:
         return "FATIGA - TOMA UN DESCANSO"
+    if estado == ESTADO_LEVE:
+        return "SOMNOLENCIA LEVE - ATENCION"
     return "CONDUCTOR ALERTA"
+
+
+def actualizar_indice_somnolencia(indice_actual, ear_suave, ear_base, hay_bostezo):
+    """
+    Integra el índice de somnolencia continuo (0-100) cuadro a cuadro.
+
+    En lugar de decidir "ojo abierto / cerrado", mide CUÁNTO está cerrado y
+    acumula esa evidencia: el índice sube de forma proporcional al cierre y
+    baja cuando el conductor está alerta, logrando una transición gradual.
+    """
+    base = ear_base if ear_base > 0 else EAR_BASE_DE_RESPALDO
+    apertura_relativa = ear_suave / base
+    apertura_relativa = max(0.0, min(1.0, apertura_relativa))
+
+    # nivel_cierre en [0, 1]: 0 = ojo bien abierto, 1 = ojo completamente cerrado.
+    nivel_cierre = (FACTOR_PERCLOS - apertura_relativa) / FACTOR_PERCLOS
+    nivel_cierre = max(0.0, min(1.0, nivel_cierre))
+
+    indice = indice_actual
+    if nivel_cierre > 0:
+        indice += SUBIDA_INDICE * nivel_cierre
+    else:
+        indice -= BAJADA_INDICE
+
+    if hay_bostezo:
+        indice += APORTE_BOSTEZO
+
+    return max(0.0, min(100.0, indice))
+
+
+def estado_desde_indice(indice):
+    """Traduce el índice de somnolencia (0-100) al estado escalonado."""
+    if indice >= UMBRAL_MICROSUENO:
+        return ESTADO_MICROSUENO
+    if indice >= UMBRAL_ALTA:
+        return ESTADO_ALTA
+    if indice >= UMBRAL_FATIGA:
+        return ESTADO_FATIGA
+    if indice >= UMBRAL_LEVE:
+        return ESTADO_LEVE
+    return ESTADO_ALERTA
 
 
 def color_texto_sobre(color_fondo):
@@ -236,8 +314,9 @@ def dibujar_banner(frame, estado, calibrando, hay_rostro):
                 color_texto_sobre(color), 2)
 
 
-def dibujar_panel(frame, ear, mar, ear_base, hay_rostro, calibrando):
-    """Panel inferior translúcido con las métricas en vivo."""
+def dibujar_panel(frame, ear, mar, ear_base, perclos, indice, estado,
+                  hay_rostro, calibrando):
+    """Panel inferior translúcido con las métricas en vivo y la barra de nivel."""
     alto, ancho = frame.shape[:2]
     y0 = alto - ALTO_PANEL
 
@@ -252,11 +331,28 @@ def dibujar_panel(frame, ear, mar, ear_base, hay_rostro, calibrando):
 
     umbral_ear = FACTOR_OJO_CERRADO * ear_base
     estado_calib = "calibrando" if calibrando else "listo"
-    linea1 = "EAR {:.2f}  (umbral {:.2f}, base {:.2f})".format(
-        ear, umbral_ear, ear_base)
+    linea1 = "EAR {:.2f}  (umbral {:.2f}, base {:.2f})  PERCLOS {:.0f}%".format(
+        ear, umbral_ear, ear_base, perclos)
     linea2 = "MAR {:.2f}  |  calibracion: {}".format(mar, estado_calib)
-    cv2.putText(frame, linea1, (15, y0 + 30), FUENTE, ESCALA_PANEL, COLOR_BLANCO, 2)
-    cv2.putText(frame, linea2, (15, y0 + 58), FUENTE, ESCALA_PANEL, COLOR_BLANCO, 2)
+    cv2.putText(frame, linea1, (15, y0 + 22), FUENTE, ESCALA_PANEL, COLOR_BLANCO, 2)
+    cv2.putText(frame, linea2, (15, y0 + 44), FUENTE, ESCALA_PANEL, COLOR_BLANCO, 2)
+
+    # Barra horizontal del índice de somnolencia (0-100).
+    etiqueta = "Somnolencia: {:.0f}/100".format(indice)
+    cv2.putText(frame, etiqueta, (15, y0 + 66), FUENTE, ESCALA_PANEL,
+                COLOR_BLANCO, 2)
+    barra_x0 = 15
+    barra_x1 = ancho - 15
+    barra_y0 = y0 + 74
+    barra_y1 = y0 + 88
+    cv2.rectangle(frame, (barra_x0, barra_y0), (barra_x1, barra_y1),
+                  COLOR_BLANCO, 1)
+    ancho_util = barra_x1 - barra_x0 - 2
+    relleno = int(ancho_util * max(0.0, min(100.0, indice)) / 100.0)
+    if relleno > 0:
+        cv2.rectangle(frame, (barra_x0 + 1, barra_y0 + 1),
+                      (barra_x0 + 1 + relleno, barra_y1 - 1),
+                      color_de_estado(estado), -1)
 
 
 # ==========================================================================
@@ -381,6 +477,13 @@ def main():
     primer_microsueno_s = None
     peligro_anterior = False
 
+    # Estado del índice de somnolencia continuo.
+    ear_suave = None                  # EAR suavizado (EMA); None hasta el primer rostro
+    indice_somnolencia = 0.0          # señal integrada 0-100
+    indice_maximo = 0.0               # pico alcanzado (para el resumen)
+    ventana_perclos = deque(maxlen=max(1, int(VENTANA_PERCLOS_S * fps)))
+    perclos = 0.0                     # % de tiempo con el ojo cerrado en la ventana
+
     print("Procesando {} ({}x{} @ {:.0f} fps)...".format(
         descripcion, ancho, alto, fps))
 
@@ -437,25 +540,40 @@ def main():
             else:
                 cuadros_boca_abierta = 0
 
-            hay_microsueno = cuadros_ojo_cerrado >= FRAMES_MICROSUENO
             hay_bostezo = cuadros_boca_abierta >= FRAMES_BOSTEZO
 
-            # Paso 4: decisión escalonada del estado.
-            if calibrando:
-                estado = ESTADO_ALERTA
-            elif hay_microsueno:
-                estado = ESTADO_MICROSUENO
-            elif hay_bostezo:
-                estado = ESTADO_FATIGA
+            # Paso 4: índice de somnolencia continuo.
+            # EAR suavizado (EMA) para que el índice no salte con el ruido.
+            if ear_suave is None:
+                ear_suave = ear
             else:
+                ear_suave = ALFA_SUAVIZADO_EAR * ear + (1 - ALFA_SUAVIZADO_EAR) * ear_suave
+
+            # PERCLOS: % de cuadros recientes con el ojo "cerrado" (apertura < P80).
+            base = ear_base if ear_base > 0 else EAR_BASE_DE_RESPALDO
+            apertura_relativa = ear_suave / base
+            ventana_perclos.append(1 if apertura_relativa < FACTOR_PERCLOS else 0)
+            perclos = 100.0 * sum(ventana_perclos) / len(ventana_perclos)
+
+            if calibrando:
+                # Durante la calibración no acumulamos: el índice queda en 0.
+                indice_somnolencia = 0.0
                 estado = ESTADO_ALERTA
+            else:
+                indice_somnolencia = actualizar_indice_somnolencia(
+                    indice_somnolencia, ear_suave, ear_base, hay_bostezo)
+                estado = estado_desde_indice(indice_somnolencia)
+
+            indice_maximo = max(indice_maximo, indice_somnolencia)
 
             dibujar_ojos_y_boca(frame, pts_ojo_der, pts_ojo_izq,
                                 [sup, inf, izq, der], color_de_estado(estado))
         else:
-            # Sin rostro: no acumulamos alarmas y reiniciamos los conteos.
+            # Sin rostro: el índice decae gradualmente y reiniciamos conteos.
             cuadros_ojo_cerrado = 0
             cuadros_boca_abierta = 0
+            ear_suave = None
+            indice_somnolencia = max(0.0, indice_somnolencia - BAJADA_INDICE)
 
         # Registro del evento de microsueño.
         if estado == ESTADO_MICROSUENO:
@@ -472,7 +590,8 @@ def main():
         # Paso 4: anotación final del cuadro.
         dibujar_borde_estado(frame, estado, hay_rostro)
         dibujar_banner(frame, estado, calibrando, hay_rostro)
-        dibujar_panel(frame, ear, mar, ear_base, hay_rostro, calibrando)
+        dibujar_panel(frame, ear, mar, ear_base, perclos, indice_somnolencia,
+                      estado, hay_rostro, calibrando)
 
         escritor.write(frame)
 
@@ -492,6 +611,7 @@ def main():
     print("\nResumen")
     print("  Cuadros procesados : {}".format(cuadros_totales))
     print("  EAR base calibrado : {:.3f}".format(ear_base))
+    print("  Indice maximo      : {:.0f}/100".format(indice_maximo))
     print("  Cuadros en alarma  : {}".format(cuadros_en_alarma))
     if primer_microsueno_s is not None:
         print("  Primer microsueno  : t = {:.2f} s".format(primer_microsueno_s))
